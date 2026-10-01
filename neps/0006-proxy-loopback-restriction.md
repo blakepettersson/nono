@@ -63,8 +63,12 @@ Kind, minikube, local databases, and any other service on loopback.
 - Private (RFC 1918), ULA, CGNAT, or host-interface ("hairpin") ranges, and
   port-scoped allow entries. These are requested in #1994 and could build on
   the same mechanism, but they are out of scope here.
-- `--open-port` / `allow_connect_port`. Those grant the child direct,
-  kernel-level localhost TCP that never passes through the proxy.
+- `open_port` / `allow_connect_port`. These grant the child direct TCP that
+  never passes through the proxy, so `block_loopback` cannot cover them. On
+  macOS, `open_port` is limited to loopback (`remote tcp "localhost:<port>"`),
+  and `allow_connect_port` is unsupported. On Linux, Landlock scopes both by
+  destination port only, so the child can reach **any** host on a granted
+  port, not just loopback (see Security Considerations).
 - Any change to OS-level (Landlock/Seatbelt) rules.
 
 ## Proposal
@@ -228,8 +232,14 @@ every consumer in this repository is updated in the same change.
   credential routes by making them non-bypassable. Denial messages contain
   only the sanitised `host:port`.
 - **Residual exposure:**
-  - `--open-port` still grants direct loopback TCP. This is documented, and
-    the two are not combined implicitly.
+  - Direct port grants bypass the proxy and therefore this policy. On
+    macOS, `open_port` reaches loopback only. On Linux, `open_port` and
+    `allow_connect_port` are Landlock connect rules scoped by port alone
+    (`crates/nono/src/capability.rs`, `localhost_ports`), so they reach any
+    destination on that port. That weakens the proxy's host filtering in
+    general, not just this policy. It is existing behaviour and outside this
+    NEP's scope. (#1786 reports that `allow_connect_port` currently has no
+    effect in proxy mode. This NEP does not rely on that.)
   - Non-loopback private addresses (#1994) are unaffected.
   - NAT64 (`64:ff9b::/96`) embeddings of loopback are not yet matched.
   - The existing link-local (cloud metadata) floor has the same
@@ -281,8 +291,11 @@ every consumer in this repository is updated in the same change.
   (concatenate and deduplicate). Is it acceptable, or should a child be unable to
   widen a base's loopback exemptions?
 - **NAT64:** include `64:ff9b::/96` with embedded loopback in this change?
-- **`--open-port` with `block_loopback`:** warn, error, or leave as
-  documented?
+- **Direct port grants with `block_loopback`:** on Linux, `open_port` and
+  `allow_connect_port` widen direct egress to every host on the granted
+  port, not just loopback. Should combining them with `block_loopback` be a
+  launch warning or an error there, or be left as documented? On macOS the
+  grant is loopback-only, so a warning may be enough.
 
 ## Reference implementation
 
