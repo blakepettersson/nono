@@ -98,7 +98,8 @@ is:
 - `127.0.0.0/8` or `::1`;
 - the unspecified address `0.0.0.0` or `::`, because `connect(2)` to it
   reaches localhost;
-- an IPv4-mapped IPv6 form of either (`::ffff:127.0.0.1`).
+- an IPv4-mapped IPv6 form of either: all of `::ffff:127.0.0.0/104`, and
+  `::ffff:0.0.0.0`.
 
 Or if the hostname is `localhost` or ends in `.localhost` (RFC 6761). This is
 matched after normalising case, the trailing dot, and Unicode label
@@ -106,6 +107,32 @@ separators.
 
 The proxy dials the addresses it checked (`CheckResult::resolved_addrs`), so a
 DNS answer that changes between check and connect cannot reach loopback.
+
+### Through an upstream proxy
+
+With `upstream_proxy`, the proxy does not dial the destination itself. It
+sends `CONNECT <host>:<port>` to the enterprise proxy, which resolves the name
+again. That second answer can differ from the one checked locally. If the
+enterprise proxy runs on the same machine, as many endpoint agents do, a
+rebound answer reaches local loopback.
+
+Under `block_loopback`, every request a client sends through the upstream
+proxy (the CONNECT tunnel and plain-HTTP forwarding) names the **first
+checked IP** instead of the hostname, bracketed for IPv6. If the name does not
+resolve locally, there is nothing safe to pin to, so the request is refused
+with `502` before anything is sent upstream. Forwarding the hostname would
+skip the loopback check entirely.
+
+Without `block_loopback`, the hostname is forwarded as today.
+
+Pinning changes what the enterprise proxy sees: an IP instead of a name. A
+proxy that filters by domain may then refuse the request. That is a
+fail-closed outcome, but it can make the two settings impractical together
+with such a proxy (see Open Questions).
+
+Route-scoped dials through the upstream proxy (reverse-proxy routes and
+TLS-intercepted routes) are outside the loopback policy (see below), so they
+are not pinned.
 
 ### Evaluation order
 
@@ -118,9 +145,19 @@ cannot override it.
 A credential route to a loopback upstream (e.g. `https://localhost:6443`) must
 keep working. The exemption is tied to **who is dialling**: when the proxy
 dials a route's upstream, after the route's endpoint policy and credential
-injection have run, the check is bypassed (`check_route_upstream`). A client
-request to the same `host:port`, whether CONNECT or plain HTTP, is checked
-normally and refused.
+injection have run, the check is bypassed (`check_route_upstream`).
+
+Routes can be reached two ways, and both stay mediated:
+
+- **Reverse proxy:** the client sends a request to the route's prefix on the
+  proxy, and the proxy dials the upstream.
+- **TLS intercept:** a client `CONNECT` to a route upstream that needs L7
+  visibility is accepted and terminated locally. Each inner request then
+  passes the route's policy before the proxy dials the upstream.
+
+What is refused is an **unmediated** path to that address: a CONNECT tunnel
+that relays raw bytes to the upstream, or a plain-HTTP forward to it. Both are
+checked with the loopback policy applied.
 
 Exempting by address would reopen the bypass. If `localhost:6443` were
 allowlisted because a route uses it, a client could address it directly and
@@ -128,26 +165,32 @@ skip the route.
 
 ### Fail closed without a proxy
 
-`block_loopback` is enforced by the proxy. If a profile sets it but enables
-no proxy feature (`network_profile`, `allow_domain`, `credentials`, or
-`upstream_proxy`), there is no proxy to enforce it, and the child would get
+`block_loopback` is enforced by the proxy. If a profile sets it but nothing
+starts the proxy, there is no proxy to enforce it, and the child would get
 unrestricted loopback. That configuration is rejected at launch with an error
 that names the cause and points to `network.block` as the alternative.
 
+"Starts the proxy" uses the same condition as the rest of the launch path
+(`ProxyLaunchOptions::is_active`) rather than a separate list. Today that is
+any of `network_profile`, `allow_domain`, `deny_domain`, endpoint rules,
+`credentials`, credential routes, or `upstream_proxy`.
+
 ### Library surface (`nono`)
 
-Adds a variant to `nono::net_filter::FilterResult`:
+None. The decision type lives in `nono-proxy`:
 
 ```rust
-DenyLoopback { destination: String }
+pub enum ProxyFilterResult {
+    Host(nono::net_filter::FilterResult),
+    DenyLoopback { destination: String },
+}
 ```
 
-The library never produces it on its own; it only carries the decision. The
-policy (whether loopback is restricted, and which ports are exempt) lives in
-`nono-proxy` (`LoopbackPolicy`) and is configured by `nono-cli`.
-
-`FilterResult` is not `#[non_exhaustive]`, so adding a variant breaks
-downstream exhaustive `match`es. See Open Questions.
+The proxy's own check result (`CheckResult::result`) is this type. Callers
+only use `is_allowed()` and `reason()`, so call sites don't change. The
+library's public `FilterResult` stays as it is: no new variant and no API
+break. The policy itself (`LoopbackPolicy`) also lives in `nono-proxy` and is
+configured by `nono-cli`.
 
 ### Platforms
 
@@ -159,7 +202,11 @@ child's loopback interface.
 ### Backward compatibility
 
 Additive and off by default. Existing profiles behave exactly as before. The
-schema gains two optional fields.
+schema gains two optional fields. The `nono` library API is unchanged.
+
+Within `nono-proxy`, `CheckResult::result` changes from the library's
+`FilterResult` to `ProxyFilterResult`. `nono-proxy` is a workspace crate, and
+every consumer in this repository is updated in the same change.
 
 ## Security Considerations
 
@@ -170,12 +217,13 @@ schema gains two optional fields.
 - **Fail-secure:** without a proxy, `block_loopback` is a launch error rather
   than being silently ignored. A failed DNS lookup yields no addresses, and
   the proxy then refuses to connect (`502`) rather than re-resolving.
-  Every resolved address is checked, so one loopback address among several
-  answers is enough to deny.
+  Through an upstream proxy, a target with no checked address is refused
+  rather than forwarded by name. Every resolved address is checked, so one
+  loopback address among several answers is enough to deny.
 - **Path handling:** not applicable; no filesystem paths are involved.
-- **Library/CLI boundary:** the library gains only a result variant with no
-  policy. The decision of whether, when and which ports belongs to
-  `nono-cli`/`nono-proxy`.
+- **Library/CLI boundary:** unchanged. The `nono` library gains nothing. The
+  mechanism and its result type live in `nono-proxy`, and the policy (whether
+  to restrict, which ports to exempt) is set by `nono-cli`.
 - **Credentials:** no new credential handling. The change *protects*
   credential routes by making them non-bypassable. Denial messages contain
   only the sanitised `host:port`.
@@ -184,6 +232,11 @@ schema gains two optional fields.
     the two are not combined implicitly.
   - Non-loopback private addresses (#1994) are unaffected.
   - NAT64 (`64:ff9b::/96`) embeddings of loopback are not yet matched.
+  - The existing link-local (cloud metadata) floor has the same
+    upstream-proxy re-resolution gap described above. Pinning is applied only
+    under `block_loopback` here. Extending it to the link-local floor changes
+    behaviour for every upstream-proxy user, so it should be a separate
+    change.
 
 ## Alternatives Considered
 
@@ -196,15 +249,25 @@ schema gains two optional fields.
   enforced on macOS and silently not on Linux.
 - **Address-based exemption for route upstreams.** Reopens the bypass (see
   above).
+- **A `DenyLoopback` variant on the library's `FilterResult`.** An earlier
+  draft of this NEP proposed it. It breaks downstream exhaustive `match`es,
+  because the enum is not `#[non_exhaustive]`, and puts a proxy-only decision
+  in the policy-free library. Adding `#[non_exhaustive]` would fix the first
+  problem but not the second.
+- **Reject `block_loopback` with `upstream_proxy` at launch.** Simpler, and
+  avoids pinning, but blocks a legitimate setup. It remains the fallback if
+  pinning proves impractical (see Open Questions).
 - **Default on.** Reverses current behaviour, where the proxy reaches loopback
   unless told otherwise, and would break existing setups that proxy to local
   dev servers. Left as an open question.
 
 ## Open Questions
 
-- **API break:** add `#[non_exhaustive]` to `FilterResult` as part of this
-  change (it is pre-1.0, and NEP-0001 covers API freezing), or keep
-  `DenyLoopback` private to `nono-proxy`?
+- **Upstream proxies that filter by domain:** pinning the CONNECT target to an
+  IP may be refused by an enterprise proxy that allowlists names. Is that
+  acceptable as the fail-closed outcome, or should `block_loopback` plus
+  `upstream_proxy` be rejected at launch instead, so the conflict is reported
+  up front?
 - **Default:** should loopback restriction become the default at 1.0.0? It
   would reach parity with the link-local floor and with #1994's request 1.
 - **Generalisation:** should this become a destination-class policy (loopback
